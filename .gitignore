@@ -5,3 +5,5 @@ __pycache__/
 .venv/
 .pytest_cache/
 .DS_Store
+_fire_dispatch.ps1
+_*.ps1
