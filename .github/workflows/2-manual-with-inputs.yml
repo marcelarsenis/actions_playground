@@ -1,0 +1,29 @@
+name: 2 - Manual With Inputs
+
+# Only triggers when you click "Run workflow" in the Actions tab.
+# 'workflow_dispatch' lets us define inputs that show up in a UI form.
+on:
+  workflow_dispatch:
+    inputs:
+      message:
+        description: 'A message to echo back'
+        required: true
+        default: 'Hello!'
+      shout:
+        description: 'Should the message be UPPERCASED?'
+        type: boolean
+        required: false
+        default: false
+
+jobs:
+  echo:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Echo the message
+        run: |
+          MSG="${{ inputs.message }}"
+          if [ "${{ inputs.shout }}" = "true" ]; then
+            echo "$MSG" | tr '[:lower:]' '[:upper:]'
+          else
+            echo "$MSG"
+          fi

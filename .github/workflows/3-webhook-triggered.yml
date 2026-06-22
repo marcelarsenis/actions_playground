@@ -1,0 +1,40 @@
+name: 3 - Webhook Triggered
+
+# This workflow only fires when an external system POSTs to the
+# "repository_dispatch" GitHub API endpoint. This is exactly how we'll
+# wire up dbt Cloud failure webhooks later.
+#
+# Trigger it from your laptop with:
+#
+#   curl -X POST \
+#     -H "Authorization: token YOUR_GITHUB_PAT" \
+#     -H "Accept: application/vnd.github+json" \
+#     https://api.github.com/repos/<OWNER>/<REPO>/dispatches \
+#     -d '{"event_type":"dbt-failure","client_payload":{"run_id":12345,"job_name":"Production Daily Build"}}'
+#
+# 'event_type' must match one of the entries below.
+on:
+  repository_dispatch:
+    types:
+      - dbt-failure
+      - test-event
+
+jobs:
+  handle-dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Show the event metadata
+        run: |
+          echo "Event type: ${{ github.event.action }}"
+          echo "Triggered by: ${{ github.actor }}"
+
+      - name: Show the client payload (the JSON we POSTed)
+        run: |
+          echo '${{ toJson(github.event.client_payload) }}'
+
+      - name: Pull specific fields out of the payload
+        run: |
+          RUN_ID="${{ github.event.client_payload.run_id }}"
+          JOB_NAME="${{ github.event.client_payload.job_name }}"
+          echo "Run ID:   $RUN_ID"
+          echo "Job name: $JOB_NAME"

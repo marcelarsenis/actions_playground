@@ -1,0 +1,26 @@
+name: 1 - Hello World
+
+# This workflow runs on every push to the repo, AND can be triggered manually
+# from the Actions tab in GitHub.
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  greet:
+    # 'ubuntu-latest' is a fresh Linux VM that GitHub spins up for this run.
+    # The VM is destroyed after the run finishes.
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Print a greeting
+        run: echo "Hello from GitHub Actions!"
+
+      - name: Print the current date
+        run: date
+
+      - name: Print where we are running
+        run: |
+          echo "OS: $(uname -a)"
+          echo "Working dir: $(pwd)"
+          echo "User: $(whoami)"
