@@ -1,0 +1,19 @@
+version: 2
+
+sources:
+  - name: raw
+    description: Raw event data from upstream system
+    tables:
+      - name: page_events
+        description: One row per page view event
+        columns:
+          - name: event_id
+            description: Unique identifier for the event
+          - name: user_id
+            description: User who triggered the event
+          - name: page_url
+            description: URL of the page viewed
+          - name: event_timestamp
+            description: When the event occurred
+          - name: _ingested_at
+            description: When the row landed in the warehouse

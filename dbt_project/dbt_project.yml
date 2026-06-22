@@ -1,0 +1,20 @@
+name: 'fake_dbt_project'
+version: '1.0.0'
+config-version: 2
+
+profile: 'fake_dbt_project'
+
+model-paths: ["models"]
+seed-paths: ["seeds"]
+target-path: "target"
+clean-targets:
+  - "target"
+  - "dbt_packages"
+
+models:
+  fake_dbt_project:
+    staging:
+      +materialized: view
+    marts:
+      +materialized: incremental
+      +on_schema_change: append_new_columns

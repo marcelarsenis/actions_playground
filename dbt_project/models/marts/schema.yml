@@ -1,0 +1,14 @@
+version: 2
+
+models:
+  - name: daily_user_page_views
+    description: |
+      Daily aggregation of page view counts per user. One row per (user_id, event_date).
+      Materialized incrementally for performance.
+    columns:
+      - name: user_id
+      - name: event_date
+      - name: page_view_count
+      - name: distinct_pages_viewed
+      - name: first_view_at
+      - name: last_view_at
