@@ -1,18 +1,12 @@
 {{
     config(
         materialized='incremental',
-        incremental_strategy='merge'
+        incremental_strategy='merge',
+        unique_key=['user_id', 'event_date']
     )
 }}
 
 -- Daily aggregation of page views per user.
--- Buggy: incremental with merge strategy needs a unique_key, but none is set.
--- When Snowflake tries to merge new rows on top of existing rows, it has no
--- way to identify duplicates, leading to the merge picking up multiple
--- candidate rows for the same target row.
---
--- Real-world failure mode (matches Pendo incidents in prod):
---   100090 (42P18): Duplicate row detected during DML action
 
 with page_events as (
 
