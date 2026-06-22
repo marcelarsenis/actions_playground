@@ -24,7 +24,7 @@ aggregated as (
         user_id,
         cast(event_timestamp as date) as event_date,
         count(*) as page_view_count,
-        count(distinct page_url) as distinct_pages_viewed,
+        count(distinct page_path) as distinct_pages_viewed,
         min(event_timestamp) as first_view_at,
         max(event_timestamp) as last_view_at
     from page_events

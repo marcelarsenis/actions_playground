@@ -6,12 +6,12 @@
 
 -- Most-viewed pages over the last 30 days, ranked.
 -- Depends on stg_page_events.
--- Will also fail because of the page_url -> page_path rename.
+-- Depends on stg_page_events.
 
 with recent_events as (
 
     select
-        page_url,
+        page_path,
         user_id,
         event_timestamp
     from {{ ref('stg_page_events') }}
@@ -22,7 +22,7 @@ with recent_events as (
 ranked as (
 
     select
-        page_url,
+        page_path,
         count(*) as view_count,
         count(distinct user_id) as unique_users
     from recent_events
@@ -31,7 +31,7 @@ ranked as (
 )
 
 select
-    page_url,
+    page_path,
     view_count,
     unique_users,
     rank() over (order by view_count desc) as popularity_rank
