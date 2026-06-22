@@ -17,8 +17,8 @@ models:
     description: |
       Most-viewed pages over a rolling 30-day window, ranked by view count.
     columns:
-      - name: page_url
-        description: URL of the page
+      - name: page_path
+        description: Path of the page viewed
       - name: view_count
       - name: unique_users
       - name: popularity_rank
