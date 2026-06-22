@@ -2,193 +2,223 @@
 
 ## What this is
 
-An autonomous agent that watches our prod dbt Cloud jobs (`Production Daily Build` 12032 and `Production Hourly Build` 22404). When one fails, the agent investigates the failure, proposes a fix, validates it actually works by running dbt against a dev schema, and opens a pull request on `cw_dbt` for human review.
+When a prod dbt job fails (`Production Daily Build` 12032 or `Production Hourly Build` 22404), our existing Azure Function receives the dbt Cloud webhook, pulls the error context, and creates a richly-formatted GitHub Issue on `cw_dbt` describing what broke. A human triages the issue, clicks "Assign to Agent" if it looks fixable, and **GitHub Copilot Coding Agent** does the actual diagnosis, code change, and PR creation.
 
-The point is to wake up to a reviewable PR instead of a stack trace.
+The point: turn 3am dbt failures into a clean queue of triaged-and-fixable issues by 9am, with one-click AI fixes that produce reviewable PRs.
 
 ## End-to-end flow
 
 ```
-dbt Cloud job fails
+dbt Cloud job fails (run_status = Error)
         |
         v
 dbt Cloud sends webhook (POST + HMAC signature)
         |
         v
-Azure Function (webhook receiver)
+Azure Function (existing, slimmed down)
    - validates HMAC signature
-   - filters: only act on monitored job IDs
-   - filters: only act on run_status = Error
-   - translates the dbt payload into a GitHub repository_dispatch event
-   - POSTs to api.github.com/repos/<owner>/cw_dbt/dispatches
+   - filters: monitored job IDs only
+   - filters: run_status = Error only
+   - pulls failure context from dbt Cloud API
+       (failing model name, error message, file path, run URL, run logs)
+   - creates a GitHub Issue on cw_dbt with that context
         |
         v
-GitHub Actions workflow on cw_dbt fires
-   - checks out cw_dbt
-   - installs dbt-snowflake + python deps
-   - pulls full failure context from dbt Cloud API
-       (manifest.json, catalog.json, run_results.json, error message,
-        failing model SQL, upstream/downstream models)
-   - calls Cortex inference REST API with the context
-       (claude-sonnet-4 or whatever we land on)
-   - LLM proposes a fix (modified SQL or YAML)
-   - workflow writes the proposed change to disk
-   - runs `dbt build --select <model>` against dev schema
-   - if pass:
-       - run downstream models too to confirm no regression
-       - commit fix to a branch
-       - open PR with summary of what was tried and why
-   - if fail:
-       - feed dbt's error back to LLM
-       - try again, capped at 3 to 5 iterations
-       - if still failing, open a "needs human" issue with full context
+Issue appears in cw_dbt's issue tracker
+   - title: "[Auto] <Job name> failed: <model name>"
+   - body: error, file path, run links, suggested prompt for Copilot
         |
         v
-PR appears on cw_dbt
+Human triages (could be anyone on the team)
+   - looks at the issue
+   - decides: fixable by AI? yes -> click "Assign to Agent"
+              maybe   -> add notes, then assign
+              no      -> close the issue, fix manually
         |
         v
-Human reviews and merges (or closes)
+GitHub Copilot Coding Agent picks it up
+   - reads the issue body
+   - reads the cw_dbt codebase
+   - runs `dbt parse` + `dbt compile` to verify the fix at least compiles
+   - opens a PR linked back to the issue
+        |
+        v
+Human reviews the PR
+   - reads the proposed fix
+   - checks out the branch locally
+   - runs `dbt build --select <model> --target dev` to validate
+   - merges if good, closes if bad
 ```
 
-## Why the Azure piece is still there
+## Why this design
 
-We already have an Azure Function (`func-cw-dbtagent-001`) wired up to dbt Cloud's webhook with HMAC validation working and job-ID filtering in place. Rather than tear it down, we reuse it as a thin translator between dbt Cloud's webhook format and GitHub's `repository_dispatch` API.
+We arrived here after evaluating two more ambitious versions:
 
-This split is intentional:
+### Version A: Fully autonomous Azure-hosted agent
+Original plan. Azure Function with a queue, an orchestrator, an LLM client (Cortex via REST), a GitHub client for PRs, a Teams notifier, and an approval handler. Got most of the way built before we realized the AI step needed credentials we didn't want to set up (Snowflake PAT with network policy, GitHub PAT with PR-create scope, possibly Anthropic key).
 
-- The Azure Function does the boring webhook-receiver job (HMAC verify, filter noise, idempotency check)
-- GitHub Actions does the real work (clone, run dbt, call LLM, open PR)
+### Version B: GitHub Actions-hosted agent
+Replace Azure with a GitHub Actions workflow that runs the agent loop ourselves (LLM call → fix → dbt build → iterate → PR). Cleaner credential story (only Snowflake creds + LLM creds in GitHub Secrets). But still required service-user negotiation, prompt engineering for the iteration loop, cost guards, and roughly 1.5–2 weeks of focused engineering.
 
-Could we collapse this and have dbt Cloud POST directly to GitHub? In theory, yes. dbt Cloud webhooks let you set a custom URL with a signed payload, but the signature scheme is dbt's HMAC, not GitHub's auth header. GitHub's `repository_dispatch` endpoint expects a specific `Authorization: token <PAT>` header, which dbt Cloud doesn't send. So we need something in the middle to translate. The Azure Function is that translator.
+### Version C: This one (issue-creation + Copilot Coding Agent)
+Realized after seeing the Agents tab on cw_dbt that GitHub already runs the autonomous coding agent we were going to build. Their version has the LLM, the iteration loop, the dev sandbox, and PR creation all wired up. We just feed it issues.
 
-The Azure Function gets dramatically simpler than what we built originally. No more queue, no more orchestrator, no more AI agent code in Python. Just:
+The key insight: **since we're going to review every PR anyway, the marginal value of fully-autonomous trigger is low**. The "human clicks Assign to Agent" step costs ~2 seconds and gains a triage layer that prevents the agent from burning premium-request quota on un-fixable failures.
 
-1. Receive POST
-2. Validate HMAC
-3. If monitored job + status = Error, fire `repository_dispatch` to GitHub
-4. Return 200
+## What we keep, what we throw away
 
-Maybe 50 lines of Python.
+From the original Azure build:
+
+| Component | Status |
+|-----------|--------|
+| `webhook_receiver` (HTTP trigger, HMAC validation) | Keep |
+| `failure_investigator.py` (pulls run context from dbt Cloud) | Keep, simplify |
+| `dbt_cloud_client.py` | Keep |
+| `config.py` | Keep, slim down |
+| `host.json` | Keep |
+| `agent_orchestrator` (queue trigger) | Drop |
+| `dbt-failures` storage queue | Drop |
+| `ai_agent.py` | Drop |
+| `github_client.py` (PR creation logic) | Drop |
+| `teams_notifier.py` | Drop |
+| `approval_handler` | Drop |
+
+Net result: the Azure Function shrinks from a ~600-line orchestration thing to maybe ~100 lines of "receive webhook, format issue, POST to GitHub."
 
 ## Component map
 
-### Azure Function: webhook receiver
+### Azure Function (slimmed down)
 
-- **Code lives in:** `agent_mvp` repo (existing, will be slimmed down)
+- **Lives in:** existing `agent_mvp` repo, gets pruned heavily
 - **Deployed to:** `func-cw-dbtagent-001` (Flex Consumption, southcentralus)
-- **Triggers:** HTTP POST from dbt Cloud webhook
-- **Outputs:** HTTPS POST to `https://api.github.com/repos/<owner>/cw_dbt/dispatches`
-- **App settings needed:**
-  - `DBT_WEBHOOK_SECRET` — for HMAC verification (already set)
-  - `MONITORED_JOB_IDS` — comma-separated list, currently `12032,22404` (already set)
-  - `GITHUB_REPO` — `<owner>/cw_dbt`
-  - `GITHUB_DISPATCH_PAT` — a fine-grained PAT scoped to `cw_dbt` only with `Contents: Write`
-- **What we drop from the original architecture:**
-  - Storage queue (`dbt-failures`)
-  - Queue trigger orchestrator
-  - AI agent code
-  - GitHub PR creation
-  - Teams notifier
-  - Approval handler
-
-### GitHub Actions workflow on cw_dbt
-
-- **Lives at:** `cw_dbt/.github/workflows/dbt-failure-agent.yml`
-- **Triggers on:** `repository_dispatch` with type `dbt-failure`
-- **Permissions block:**
-  ```yaml
-  permissions:
-    contents: write
-    pull-requests: write
+- **Code shape:**
   ```
-- **Runs on:** `ubuntu-latest` (GitHub-hosted runner). May switch to self-hosted on Azure if the DBA wants tighter IP control on the Snowflake side.
-- **Scripts it calls:**
-  - `scripts/fetch_failure.py` — pulls run details from dbt Cloud API
-  - `scripts/get_fix.py` — calls Cortex with the failure context, parses fix proposal
-  - `scripts/apply_fix.py` — writes the LLM's proposed change to disk
-  - `scripts/iterate.py` — orchestrates the build/retry loop
+  function_app.py        # one HTTP-triggered function
+  github_issue_client.py # ~30 lines: takes a payload, POSTs to GitHub Issues API
+  config.py              # env var loading
+  dbt_cloud_client.py    # existing, used to enrich the issue body
+  failure_investigator.py # existing, simplified
+  ```
+- **App settings:**
+  - `DBT_WEBHOOK_SECRET` — for HMAC verification (already set)
+  - `DBT_CLOUD_API_TOKEN` — read-only, fetches run details (already set)
+  - `DBT_CLOUD_BASE_URL`, `DBT_CLOUD_ACCOUNT_ID` (already set)
+  - `MONITORED_JOB_IDS` — `12032,22404` (already set)
+  - `GITHUB_REPO` — `cw-data-services/cw_dbt`
+  - `GITHUB_ISSUE_PAT` — fine-grained PAT, `Issues: Read and write` on `cw_dbt` only
 
-### Snowflake (Cortex + dev compute)
+### GitHub Copilot Coding Agent (already wired up by GitHub)
 
-- **Service user:** `DBT_FAILURE_AGENT_USER` (to be created by DBA, ask is queued)
-- **Auth:** PAT, stored in GitHub Secrets
-- **Network policy:** allows GitHub Actions runner IP ranges (or self-hosted runner static IP if we go that route)
-- **Cortex usage:** `/api/v2/cortex/inference:complete` for diagnosis, model TBD (claude-sonnet-4 default)
-- **dbt usage:** runs `dbt build` against a dev schema. Service user has no prod access at all.
+- **Where it runs:** GitHub-managed sandbox environment, ephemeral per run
+- **Auth:** GitHub-internal — none of our concern
+- **Trigger:** human clicks "Assign to Agent" button in the issue UI
+- **What it can do without external creds:**
+  - Read the cw_dbt codebase
+  - Read the issue body (which has all our enriched context)
+  - Run `dbt parse` and `dbt compile` (offline checks)
+  - Run other static checks (sqlfluff, dbt-checkpoint, etc.)
+  - Make file changes
+  - Open a PR linked to the issue
+- **What it can't do without external creds:**
+  - Run `dbt build` against real Snowflake data (live execution)
+  - Verify a fix actually produces correct rows
+
+The "can't run dbt build" gap is acceptable because the human reviewer does that step locally before merging — same as a normal PR review.
 
 ### dbt Cloud
 
-- **Read-only API token:** for pulling run details, manifest, error messages
-- **Stored in:** GitHub Secrets as `DBT_CLOUD_API_TOKEN`
-- **Already exists** (used during the local prototype work)
+- Webhook configured to POST to the Azure Function on `run.errored` events
+- HMAC secret already set
+- Read-only API token already in place
+
+### cw_dbt repo
+
+- No changes needed in the repo itself
+- Copilot Coding Agent is already enabled (visible from the Agents tab in the UI)
+- Optional future enhancement: add a `.github/copilot-instructions.md` to give the agent project-specific context (where models live, how to run tests locally, etc.)
 
 ## Credentials inventory
 
-What lives where, and what each thing can do:
-
-| Credential | Where stored | Scope | Risk if leaked |
+| Credential | Where stored | What it can do | Risk if leaked |
 |---|---|---|---|
-| `DBT_WEBHOOK_SECRET` | Azure App Settings | HMAC verification of dbt webhooks | Medium. Attacker could forge fake failure events. Mitigated by GitHub Actions being read-only on dbt Cloud anyway. |
-| `GITHUB_DISPATCH_PAT` | Azure App Settings | Fire `repository_dispatch` to one repo | Low. Can only trigger workflows, can't read code or modify anything else. |
-| GitHub Actions `GITHUB_TOKEN` | Auto-injected per-run by GitHub | Modify cw_dbt during one workflow run | Negligible. Ephemeral, scoped to one run, expires when run ends. |
-| `DBT_CLOUD_API_TOKEN` | GitHub Secrets on cw_dbt | Read-only on dbt Cloud account | Medium. Read access to job runs, models, errors. No write capability used. |
-| `SNOWFLAKE_PAT` for `DBT_FAILURE_AGENT_USER` | GitHub Secrets on cw_dbt | Cortex inference + dbt builds in dev only | Low to medium depending on dev schema content. No prod access. |
+| `DBT_WEBHOOK_SECRET` | Azure App Settings | HMAC verify dbt webhooks | Medium — could forge fake failure events. Triage step catches anything weird. |
+| `DBT_CLOUD_API_TOKEN` | Azure App Settings | Read-only on dbt Cloud | Medium — visibility into job runs and errors only |
+| `GITHUB_ISSUE_PAT` | Azure App Settings | Create issues on cw_dbt only | Low — could spam issues, but `Issues: Write` can't modify code or merge PRs |
 
-No personal PATs. No long-lived credentials with broad scope. Each credential does one job.
+That's it. **Three credentials, all narrowly scoped, no service-user negotiation, no Snowflake credentials, no network policies.**
 
-## Iteration loop (the hard part)
+## Issue body template (what the Azure Function generates)
 
-The workflow doesn't just call the LLM once and call it done. The loop:
+```markdown
+## Failure summary
 
-1. Pull failure context (error message, failing model SQL, related files, recent git history of those files)
-2. Send context to Cortex with a prompt that asks for a fix as structured JSON: `{ files_to_change: [...], reasoning: "..." }`
-3. Apply the proposed change to disk
-4. Run `dbt build --select <failing_model> --target dev`
-5. Capture the result
-6. If `dbt build` succeeds: break out of the loop, validate downstream, open PR
-7. If `dbt build` fails: send dbt's new error output back to the LLM with a "your previous fix didn't work, here's what happened, try again" prompt
-8. Repeat up to N iterations (default 4)
-9. If still failing after N iterations: open a "needs human investigation" issue with the LLM's notes and what was tried
+- **Job:** Production Daily Build (id: 12032)
+- **Run:** 70437506979734 ([dbt Cloud link](https://hu993.us1.dbt.com/...))
+- **Started:** 2026-06-22 03:00 ET
+- **Branch:** master
+- **Failed model:** `pendo_page_history`
+- **File:** `models/pendo/pendo_page_history.sql`
 
-This is the part that needs careful prompt engineering and conversation state management. Most of the engineering effort goes here.
+## Error
 
-## Cost guards
+```
+Database Error in model pendo_page_history
+  100090 (42P18): Duplicate row detected during DML action
+```
 
-- Hard cap of 4 LLM iterations per failure
-- GitHub Actions workflow timeout: 30 minutes
-- Snowflake warehouse: small (XS) for the agent's dev runs
-- Idempotency: don't fire on the same `run_id` twice (use a small marker file in a GitHub branch or an Azure Table)
+## Suggested context for the agent
 
-Worst case for one failure: ~4 LLM calls (~$2), ~4 dbt builds (~30 seconds of XS warehouse time), one PR creation. Maybe $3 per failure. If we get 10 failures a month, $30 a month. Manageable.
+This looks like a classic incremental-model dedup issue. Likely fixes:
+- Add or fix a `unique_key` on the incremental config
+- Add a deduplication step before the merge
+- Switch incremental_strategy
 
-## What we're not building (yet)
+## How to validate before merging
 
-- Teams notifications. The PR shows up in your GitHub notifications, that's enough for now. Can add later.
-- Auto-merge. The agent only opens PRs. A human always merges. This is by design.
-- Multi-model fixes. If a failure cascades and three models need to change, v1 punts and asks a human. v2 might handle it.
-- Cross-repo fixes. Some dbt failures are caused by upstream Fivetran schema changes. The agent only edits files in cw_dbt for v1.
+```bash
+git checkout <agent-branch>
+dbt build --select pendo_page_history --target dev
+```
+```
+
+That structured body is what makes Copilot effective — it doesn't have to dig for context, it's all there.
 
 ## Open questions / dependencies
 
-- [ ] Snowflake service user needs to be provisioned (ask sent)
-- [ ] Confirm Cortex models available in our region/edition
-- [ ] Decide on GitHub-hosted vs self-hosted runners (impacts network policy)
-- [ ] Pick a dev schema for the agent to materialize into (probably a fresh `DBT_AGENT_DEV` to keep it isolated)
-- [ ] Idempotency mechanism: GitHub branch marker vs Azure Table vs in-workflow check via gh API
-- [ ] Cortex tool-calling format: confirm Snowflake's REST API matches OpenAI's tools schema or has its own
+- [ ] Confirm Copilot Coding Agent license actually includes premium-request capacity for `cw_dbt` use volume (already enabled, just need to confirm quota)
+- [ ] Decide: Azure Function caller's PAT — owned by Marcel personally, or by a team service identity? Ideally team-owned so it doesn't break when individuals change roles.
+- [ ] Decide: should the Azure Function auto-tag certain failures with labels like `dbt-failure` for filtering?
+- [ ] Optional: add `.github/copilot-instructions.md` to cw_dbt with project-specific guidance for the agent
+- [ ] Optional: idempotency check — don't create duplicate issues for the same `run_id` if dbt Cloud retries the webhook
 
-## What's been tried and tossed
+## What's not in scope (and might never be)
 
-We initially built the whole thing inside Azure (queue, orchestrator, AI agent, GitHub client, Teams notifier, approval handler). It worked end-to-end up to the AI step but the architecture had problems:
+- **Auto-assign to Copilot.** Possible, but requires a Classic PAT with `repo` scope or a GitHub App. Saves ~2 seconds per failure but loses the triage layer. Probably not worth it.
+- **Teams notifications.** GitHub's own notifications already handle this — issue assigned, PR opened, etc. all show up in your inbox if you're a member of the repo.
+- **Automated dbt build validation.** Would require Snowflake service-user setup. Skip for v1; the human reviewer handles validation locally.
+- **Multi-model fixes.** When one failure cascades to several models, the agent might need to touch multiple files. Copilot can handle this in principle; we'll see how it does in practice.
 
-- Required service credentials living in Azure App Settings (not a key vault, not federated)
-- Snowflake PAT required a network policy that wasn't in place yet
-- GitHub PAT required for PR creation, which felt heavy for a personal-PAT MVP
-- Teams card with approval buttons added complexity for limited value (you'd see the PR in GitHub anyway)
+## Effort to ship
 
-The pivot to GitHub Actions does three things at once:
-- GitHub Actions runtime gets a free `GITHUB_TOKEN`, no PAT needed for PR creation
-- Service credentials live in GitHub Secrets, which has the right access controls
-- The workflow runs in a fresh Linux container with the repo checked out, which is exactly the environment dbt + LLM tooling expects
+Roughly:
 
-Most of the existing Azure code becomes unnecessary. The webhook receiver stays, slimmed down. Everything else moves to GitHub Actions.
+| Task | Time |
+|---|---|
+| Slim down `function_app.py` to just the webhook handler | 1 hour |
+| Write `github_issue_client.py` (~30 lines) | 1 hour |
+| Build the issue body template with all the enrichment | 2 hours |
+| Generate fine-grained PAT, add to App Settings | 5 minutes |
+| Redeploy Azure Function | 15 minutes |
+| Test end-to-end: trigger a fake failure, see issue appear, assign Copilot, watch PR | 30 minutes |
+
+**Probably half a day** of actual work. Plus whatever ad-hoc tuning the issue template needs after watching Copilot's first few real-world runs.
+
+## What we learned during exploration
+
+A summary of dead ends so future-us doesn't relitigate:
+
+- Azure Function with full agent loop: works in theory, but credential management was untenable for an MVP
+- GitHub Actions workflow with custom LLM loop: cleaner credentials, but still ~2 weeks of work and required Snowflake service user
+- Cortex Code desktop app deep-link: Cortex Code can be opened with `coco://` URLs but has no documented "open chat with prefilled prompt" mechanism, and it's a desktop app anyway so no autonomous use possible
+- Auto-assign Copilot via fine-grained PAT: not supported, GitHub gates Bot assignment behind Classic PAT or GitHub App
+- Snowflake PAT for the agent: blocked on network policy, required admin negotiation, ultimately not needed in this design
