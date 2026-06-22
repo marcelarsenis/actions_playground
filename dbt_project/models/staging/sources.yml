@@ -11,8 +11,11 @@ sources:
             description: Unique identifier for the event
           - name: user_id
             description: User who triggered the event
-          - name: page_url
-            description: URL of the page viewed
+          - name: page_path
+            description: |
+              Path of the page viewed (e.g., '/products/sku-123').
+              NOTE: Renamed from `page_url` upstream as of 2026-06-21.
+              Some downstream models may still reference the old name.
           - name: event_timestamp
             description: When the event occurred
           - name: _ingested_at

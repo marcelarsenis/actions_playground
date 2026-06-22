@@ -12,3 +12,13 @@ models:
       - name: distinct_pages_viewed
       - name: first_view_at
       - name: last_view_at
+
+  - name: top_pages_30d
+    description: |
+      Most-viewed pages over a rolling 30-day window, ranked by view count.
+    columns:
+      - name: page_url
+        description: URL of the page
+      - name: view_count
+      - name: unique_users
+      - name: popularity_rank
