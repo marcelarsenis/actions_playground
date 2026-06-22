@@ -6,7 +6,6 @@
 
 -- Most-viewed pages over the last 30 days, ranked.
 -- Depends on stg_page_events.
--- Depends on stg_page_events.
 
 with recent_events as (
 
