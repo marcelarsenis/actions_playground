@@ -8,6 +8,6 @@ select
     event_id,
     user_id,
     page_path,
-    event_timestamp,
+    occurred_at,
     _ingested_at
 from {{ source('raw', 'page_events') }}
